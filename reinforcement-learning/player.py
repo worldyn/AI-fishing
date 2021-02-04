@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+import numpy as np
+
+from agent import Fish
+from communicator import Communicator
+from shared import SettingLoader
+
+
+class FishesModelling:
+    def init_fishes(self, n):
+        fishes = {}
+        for i in range(n):
+            fishes["fish" + str(i)] = Fish()
+        self.fishes = fishes
+
+
+class PlayerController(SettingLoader, Communicator):
+    def __init__(self):
+        SettingLoader.__init__(self)
+        Communicator.__init__(self)
+        self.space_subdivisions = 10
+        self.actions = None
+        self.action_list = None
+        self.states = None
+        self.init_state = None
+        self.ind2state = None
+        self.state2ind = None
+        self.alpha = 0
+        self.gamma = 0
+        self.episode_max = 300
+
+    def init_states(self):
+        ind2state = {}
+        state2ind = {}
+        count = 0
+        for row in range(self.space_subdivisions):
+            for col in range(self.space_subdivisions):
+                ind2state[(col, row)] = count
+                state2ind[count] = [col, row]
+                count += 1
+        self.ind2state = ind2state
+        self.state2ind = state2ind
+
+    def init_actions(self):
+        self.actions = {
+            "left": (-1, 0),
+            "right": (1, 0),
+            "down": (0, -1),
+            "up": (0, 1)
+        }
+        self.action_list = list(self.actions.keys())
+
+    def allowed_movements(self):
+        self.allowed_moves = {}
+        for s in self.ind2state.keys():
+            self.allowed_moves[self.ind2state[s]] = []
+            if s[0] < self.space_subdivisions - 1:
+                self.allowed_moves[self.ind2state[s]] += [1]
+            if s[0] > 0:
+                self.allowed_moves[self.ind2state[s]] += [0]
+            if s[1] < self.space_subdivisions - 1:
+                self.allowed_moves[self.ind2state[s]] += [3]
+            if s[1] > 0:
+                self.allowed_moves[self.ind2state[s]] += [2]
+
+    def player_loop(self):
+        pass
+
+
+class PlayerControllerHuman(PlayerController):
+    def player_loop(self):
+        """
+        Function that generates the loop of the game. In each iteration
+        the human plays through the keyboard and send
+        this to the game through the sender. Then it receives an
+        update of the game through receiver, with this it computes the
+        next movement.
+        :return:
+        """
+
+        while True:
+            # send message to game that you are ready
+            msg = self.receiver()
+            if msg["game_over"]:
+                return
+
+
+def epsilon_greedy(Q,
+                   state,
+                   all_actions,
+                   current_total_steps=0,
+                   epsilon_initial=1,
+                   epsilon_final=0.2,
+                   anneal_timesteps=10000,
+                   eps_type="constant"):
+
+    if eps_type == 'constant':
+        #print("const")
+        epsilon = epsilon_final
+    elif eps_type == 'linear':
+        sched = ScheduleLinear(anneal_timesteps,
+            epsilon_final, epsilon_initial)
+        epsilon = sched.value(current_total_steps)
+        if epsilon < epsilon_final:
+            epsilon = epsilon_final
+
+
+    else:
+        raise "Epsilon greedy type unknown"
+
+    #print("epsilon:",epsilon)
+    
+    p = np.random.uniform(0,1)
+    #print("curr steps=",current_total_steps)
+    #print("eps=",epsilon)
+
+        
+    if p < epsilon: # prob epsilon
+        num_a = len(all_actions)
+        action_idx = np.random.randint(0,num_a)
+        action = all_actions[action_idx]
+    else: # prob 1-epsilon
+        action = np.nanargmax(Q[state])
+
+    return action
+
+
+class PlayerControllerRL(PlayerController, FishesModelling):
+    def __init__(self):
+        super().__init__()
+
+    def player_loop(self):
+        # send message to game that you are ready
+        self.init_actions()
+        self.init_states()
+        self.alpha = self.settings.alpha
+        self.gamma = self.settings.gamma
+        self.epsilon_initial = self.settings.epsilon_initial
+        self.epsilon_final = self.settings.epsilon_final
+        self.annealing_timesteps = self.settings.annealing_timesteps
+        self.threshold = self.settings.threshold
+        self.episode_max = self.settings.episode_max
+
+        q = self.q_learning()
+
+        # compute policy
+        policy = self.get_policy(q)
+
+        # send policy
+        msg = {"policy": policy, "exploration": False}
+        self.sender(msg)
+
+        msg = self.receiver()
+        print("Q-learning returning")
+        return
+
+    def q_learning(self):
+        ns = len(self.state2ind.keys())
+        na = len(self.actions.keys())
+        discount = self.gamma
+        lr = self.alpha
+        # initialization
+        self.allowed_movements()
+        Q = np.zeros((ns,na))
+        for i in range(ns):
+            for j in range(na):
+                Q[i,j] =np.random.uniform()
+
+        for s in range(ns):
+            list_pos = self.allowed_moves[s]
+            for i in range(4):
+                if i not in list_pos:
+                    Q[s, i] = np.nan
+
+        Q_old = Q.copy()
+
+        diff = np.infty
+        end_episode = False
+
+        init_pos_tuple = self.settings.init_pos_diver
+        init_pos = self.ind2state[(init_pos_tuple[0], init_pos_tuple[1])]
+        episode = 0
+
+        R_total = 0
+        current_total_steps = 0
+        steps = 0
+
+        while episode <= self.episode_max and diff >= self.threshold:
+
+            s_current = init_pos
+            R_total = 0
+            steps = 0
+            while not end_episode:
+                # selection of action
+                list_pos = self.allowed_moves[s_current]
+
+                # Chose an action from all possible actions
+                possible_actions = self.allowed_moves[s_current]
+
+                action = epsilon_greedy(
+                    Q = Q,
+                    state = s_current,
+                    all_actions = possible_actions,
+                    current_total_steps = current_total_steps,
+                    epsilon_initial = self.epsilon_initial,
+                    epsilon_final = self.epsilon_final,
+                    anneal_timesteps = self.annealing_timesteps,
+                    eps_type="linear")
+
+
+                # compute reward
+                action_str = self.action_list[action]
+                msg = {"action": action_str, "exploration": True}
+                self.sender(msg)
+
+                # wait response from game
+                msg = self.receiver()
+                R = msg["reward"]
+                R_total += R
+                s_next_tuple = msg["state"]
+                end_episode = msg["end_episode"]
+                s_next = self.ind2state[s_next_tuple]
+
+                # Bellman Update equation to update Q
+                Q[s_current, action] = Q[s_current, action] + self.alpha * (R + self.gamma * np.nanmax(Q[s_next]) - Q[s_current, action])
+
+                s_current = s_next
+                current_total_steps += 1
+                steps += 1
+
+            # Compute the absolute value of the mean between the Q and Q-old
+            diff = abs(np.nanmean(Q)-np.nanmean(Q_old))
+            Q_old[:] = Q
+            print(
+                "Episode: {}, Steps {}, Diff: {:6e}, Total Reward: {}, Total Steps {}"
+                .format(episode, steps, diff, R_total, current_total_steps))
+            episode += 1
+            end_episode = False
+
+        return Q
+
+    def get_policy(self, Q):
+        max_actions = np.nanargmax(Q, axis=1)
+        policy = {}
+        list_actions = list(self.actions.keys())
+        for n in self.state2ind.keys():
+            state_tuple = self.state2ind[n]
+            policy[(state_tuple[0],
+                    state_tuple[1])] = list_actions[max_actions[n]]
+        return policy
+
+
+class PlayerControllerRandom(PlayerController):
+    def __init__(self):
+        super().__init__()
+
+    def player_loop(self):
+
+        self.init_actions()
+        self.init_states()
+        self.allowed_movements()
+        self.episode_max = self.settings.episode_max
+
+        n = self.random_agent()
+
+        # compute policy
+        policy = self.get_policy(n)
+
+        # send policy
+        msg = {"policy": policy, "exploration": False}
+        self.sender(msg)
+
+        msg = self.receiver()
+        print("Random Agent returning")
+        return
+
+    def random_agent(self):
+        ns = len(self.state2ind.keys())
+        na = len(self.actions.keys())
+        init_pos_tuple = self.settings.init_pos_diver
+        init_pos = self.ind2state[(init_pos_tuple[0], init_pos_tuple[1])]
+        episode = 0
+        R_total = 0
+        steps = 0
+        current_total_steps = 0
+        end_episode = False
+
+        while episode <= self.episode_max:
+            s_current = init_pos
+            R_total = 0
+            steps = 0
+            while not end_episode:
+                # all possible actions
+                possible_actions = self.allowed_moves[s_current]
+
+                # Chose an action from all possible actions and add to the counter of actions per state
+                action = None
+
+                action_str = self.action_list[action]
+                msg = {"action": action_str, "exploration": True}
+                self.sender(msg)
+
+                # wait response from game
+                msg = self.receiver()
+                R = msg["reward"]
+                s_next_tuple = msg["state"]
+                end_episode = msg["end_episode"]
+                s_next = self.ind2state[s_next_tuple]
+                s_current = s_next
+                R_total += R
+                current_total_steps += 1
+                steps += 1
+
+            print("Episode: {}, Steps {}, Total Reward: {}, Total Steps {}".
+                  format(episode, steps, R_total, current_total_steps))
+            episode += 1
+            end_episode = False
+
+        return n
+
+    def get_policy(self, Q):
+        nan_max_actions_proxy = [None for _ in range(len(Q))]
+        for _ in range(len(Q)):
+            try:
+                nan_max_actions_proxy[_] = np.nanargmax(Q[_])
+            except:
+                nan_max_actions_proxy[_] = np.random.choice([0, 1, 2, 3])
+
+        nan_max_actions_proxy = np.array(nan_max_actions_proxy)
+
+        assert nan_max_actions_proxy.all() == nan_max_actions_proxy.all()
+
+        policy = {}
+        list_actions = list(self.actions.keys())
+        for n in self.state2ind.keys():
+            state_tuple = self.state2ind[n]
+            policy[(state_tuple[0],
+                    state_tuple[1])] = list_actions[nan_max_actions_proxy[n]]
+        return policy
+
+
+class ScheduleLinear(object):
+    def __init__(self, schedule_timesteps, final_p, initial_p=1.0):
+        self.schedule_timesteps = float(schedule_timesteps)
+        self.final_p = final_p
+        self.initial_p = initial_p
+
+    def value(self, t):
+        # Return the annealed linear value
+        diff = self.final_p - self.initial_p
+        epsilon_t = self.initial_p + diff * (float(t) / self.schedule_timesteps)
+        return epsilon_t
